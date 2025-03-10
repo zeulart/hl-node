@@ -16,6 +16,10 @@ RUN groupadd --gid $USER_GID $USERNAME \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /home/$USERNAME/hl/data && chown -R $USERNAME:$USERNAME /home/$USERNAME/hl
 
+# Copy override_gossip_config.json to the image
+COPY override_gossip_config.json /home/$USERNAME/override_gossip_config.json
+RUN chown $USERNAME:$USERNAME /home/$USERNAME/override_gossip_config.json
+
 USER $USERNAME
 WORKDIR /home/$USERNAME
 
