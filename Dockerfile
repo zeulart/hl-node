@@ -6,8 +6,8 @@ ARG USER_GID=$USER_UID
 
 # Define URLs as environment variables
 ARG PUB_KEY_URL=https://raw.githubusercontent.com/hyperliquid-dex/node/refs/heads/main/pub_key.asc
-ARG HL_VISOR_URL=https://binaries.hyperliquid-testnet.xyz/Testnet/hl-visor
-ARG HL_VISOR_ASC_URL=https://binaries.hyperliquid-testnet.xyz/Testnet/hl-visor.asc
+ARG HL_VISOR_URL=https://binaries.hyperliquid.xyz/Mainnet/hl-visor
+ARG HL_VISOR_ASC_URL=https://binaries.hyperliquid.xyz/Mainnet/hl-visor.asc
 
 # Create user and install dependencies
 RUN groupadd --gid $USER_GID $USERNAME \
@@ -20,7 +20,7 @@ USER $USERNAME
 WORKDIR /home/$USERNAME
 
 # Configure chain to testnet
-RUN echo '{"chain": "Testnet"}' > /home/$USERNAME/visor.json
+RUN echo '{"chain": "Mainnet"}' > /home/$USERNAME/visor.json
 
 # Import GPG public key
 RUN curl -o /home/$USERNAME/pub_key.asc $PUB_KEY_URL \
@@ -36,4 +36,4 @@ RUN curl -o /home/$USERNAME/hl-visor $HL_VISOR_URL \
 EXPOSE 4000-4010
 
 # Run a non-validating node
-ENTRYPOINT ["/home/hluser/hl-visor", "run-non-validator", "--replica-cmds-style", "recent-actions"]
+ENTRYPOINT ["/home/hluser/hl-visor", "--write-trades", "--write-order-statuses"]
