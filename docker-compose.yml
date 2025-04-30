@@ -6,6 +6,7 @@ services:
     build: .
     ports:
       - "4000-4010:4000-4010"
+      - "3001:3001"
     volumes:
       - hl-data:/home/hluser/hl/data
 
