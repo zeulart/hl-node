@@ -1,0 +1,2 @@
+watchdog==6.0.0
+tailer==0.4.1
