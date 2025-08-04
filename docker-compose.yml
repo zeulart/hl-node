@@ -10,13 +10,45 @@ services:
     volumes:
       - hl-data:/home/hluser/hl/data
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --maxmemory 8gb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+      --tcp-keepalive 60
+      --timeout 0
+      --maxclients 1000
+    sysctls:
+      - net.core.somaxconn=65535
+
   pruner:
     restart: unless-stopped
     build: ./pruner
     volumes:
       - hl-data:/home/hluser/hl/data
 
+  log-streamer:
+    build: ./streaming
+    restart: unless-stopped
+    volumes:
+      - hl-data:/home/hluser/hl/data:ro
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_PATH=/home/hluser/hl/data/node_fills/hourly
 
 volumes:
   hl-data:
+    driver: local
+  redis-data:
     driver: local

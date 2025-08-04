@@ -1,0 +1,6 @@
+redis>=5.0.0
+aioredis>=2.0.0
+pyyaml>=6.0
+psutil>=5.9.0
+structlog>=23.0.0
+inotify>=0.2.10
