@@ -1,9 +1,8 @@
 import asyncio
 import time
 from typing import Dict, List, Optional, Any
-import aioredis
-from aioredis import Redis
-from aioredis.connection import ConnectionPool
+import redis.asyncio as redis
+from redis.asyncio import Redis, ConnectionPool
 import structlog
 
 logger = structlog.get_logger(__name__)
