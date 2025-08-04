@@ -10,7 +10,7 @@ import json
 import signal
 import sys
 from typing import Dict, Any
-import aioredis
+import redis.asyncio as redis
 import structlog
 
 # Configure logging
@@ -46,8 +46,9 @@ class SimpleTradeConsumer:
     async def connect(self) -> bool:
         """Connect to Redis"""
         try:
-            self.redis_client = aioredis.from_url(
-                f"redis://{self.redis_host}:{self.redis_port}",
+            self.redis_client = redis.Redis(
+                host=self.redis_host,
+                port=self.redis_port,
                 decode_responses=False  # Keep as bytes for consistency
             )
             

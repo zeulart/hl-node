@@ -1,0 +1,31 @@
+[project]
+name = "hyperliquid-streaming"
+version = "0.1.0"
+description = "Ultra-fast log streaming system for Hyperliquid node data"
+requires-python = ">=3.11"
+dependencies = [
+    "redis>=5.0.0",
+    "pyyaml>=6.0",
+    "psutil>=5.9.0",
+    "structlog>=23.0.0",
+    "inotify>=0.2.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/streaming"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]

@@ -155,12 +155,22 @@ class DirectoryWatcher:
         
         while self.running:
             try:
-                # Discover new files matching pattern
+                # Discover only the most recent file matching pattern
                 current_files = set()
                 if self.base_path.exists():
+                    newest_file = None
+                    newest_mtime = 0
+                    
                     for file_path in self.base_path.rglob(self.pattern):
                         if file_path.is_file():
-                            current_files.add(str(file_path))
+                            mtime = file_path.stat().st_mtime
+                            if mtime > newest_mtime:
+                                newest_mtime = mtime
+                                newest_file = file_path
+                    
+                    if newest_file:
+                        current_files.add(str(newest_file))
+                        logger.info("Found newest log file", path=str(newest_file), mtime=newest_mtime)
                 
                 # Add watchers for new files
                 existing_files = set(self.file_watchers.keys())

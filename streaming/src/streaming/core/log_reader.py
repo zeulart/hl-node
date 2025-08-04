@@ -44,11 +44,16 @@ class MemoryMappedLogReader:
                 access=mmap.ACCESS_READ
             )
             
+            # Start from end of file for tail mode (real-time streaming only)
+            self.current_offset = self.file_size
+            
             logger.info(
                 "Memory-mapped log file opened",
                 path=str(self.file_path),
                 size=self.file_size,
-                inode=self.inode
+                inode=self.inode,
+                start_offset=self.current_offset,
+                mode="tail"
             )
             return True
             
