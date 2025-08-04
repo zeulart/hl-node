@@ -1,7 +1,7 @@
 import os
 import time
 import redis
-from inotify import constants, watcher
+import inotify.adapters
 
 LOG_DIR = os.getenv('LOG_PATH', '/home/hluser/hl/data/node_fills/hourly')
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -55,19 +55,23 @@ def tail_log_file(file_path, rds):
 
 def setup_directory_watcher():
     """Configure inotify watcher pour détecter les nouveaux fichiers."""
-    w = watcher.Watcher()
-    
-    # Watch the base log directory for new date directories
-    if os.path.exists(LOG_DIR):
-        w.add_watch(LOG_DIR, constants.IN_CREATE | constants.IN_MOVED_TO)
+    try:
+        i = inotify.adapters.Inotify()
         
-        # Watch existing date directories for new hour files
-        for day_dir in os.listdir(LOG_DIR):
-            day_path = os.path.join(LOG_DIR, day_dir)
-            if os.path.isdir(day_path):
-                w.add_watch(day_path, constants.IN_CREATE | constants.IN_MOVED_TO)
-    
-    return w
+        # Watch the base log directory for new date directories
+        if os.path.exists(LOG_DIR):
+            i.add_watch(LOG_DIR)
+            
+            # Watch existing date directories for new hour files
+            for day_dir in os.listdir(LOG_DIR):
+                day_path = os.path.join(LOG_DIR, day_dir)
+                if os.path.isdir(day_path):
+                    i.add_watch(day_path)
+        
+        return i
+    except Exception as e:
+        print(f"Erreur inotify setup: {e}")
+        return None
 
 def main():
     rds = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -75,11 +79,14 @@ def main():
     
     # Setup inotify watcher pour détecter les nouveaux fichiers plus rapidement
     try:
-        w = setup_directory_watcher()
-        print("inotify watcher configuré")
+        watcher = setup_directory_watcher()
+        if watcher:
+            print("inotify watcher configuré")
+        else:
+            print("Fallback sur polling simple")
     except Exception as e:
         print(f"Erreur inotify: {e}, fallback sur polling")
-        w = None
+        watcher = None
     
     while True:
         latest = get_latest_file()
