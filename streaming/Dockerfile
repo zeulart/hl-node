@@ -1,43 +1,41 @@
-FROM ubuntu:24.04
+FROM python:3.11-slim
 
 ARG USERNAME=hluser
 ARG USER_UID=10000
 ARG USER_GID=$USER_UID
 
-# Define URLs as environment variables
-ARG PUB_KEY_URL=https://raw.githubusercontent.com/hyperliquid-dex/node/refs/heads/main/pub_key.asc
-ARG HL_VISOR_URL=https://binaries.hyperliquid.xyz/Mainnet/hl-visor
-ARG HL_VISOR_ASC_URL=https://binaries.hyperliquid.xyz/Mainnet/hl-visor.asc
+# Install system dependencies
+RUN apt-get update -y && apt-get install -y \
+    gcc \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create user and install dependencies
+# Create user
 RUN groupadd --gid $USER_GID $USERNAME \
-    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
-    && apt-get update -y && apt-get install -y curl gnupg \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /home/$USERNAME/hl/data && chown -R $USERNAME:$USERNAME /home/$USERNAME/hl
+    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME
 
-# Copy override_gossip_config.json to the image
-COPY override_gossip_config.json /home/$USERNAME/override_gossip_config.json
-RUN chown $USERNAME:$USERNAME /home/$USERNAME/override_gossip_config.json
+# Set working directory
+WORKDIR /app
 
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY src/ ./src/
+COPY config/ ./config/
+
+# Change ownership to non-root user
+RUN chown -R $USERNAME:$USERNAME /app
+
+# Switch to non-root user
 USER $USERNAME
-WORKDIR /home/$USERNAME
 
-# Configure chain to testnet
-RUN echo '{"chain": "Mainnet"}' > /home/$USERNAME/visor.json
+# Set Python path
+ENV PYTHONPATH=/app/src
 
-# Import GPG public key
-RUN curl -o /home/$USERNAME/pub_key.asc $PUB_KEY_URL \
-    && gpg --import /home/$USERNAME/pub_key.asc
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import redis; r=redis.Redis(host='redis'); r.ping()" || exit 1
 
-# Download and verify hl-visor binary
-RUN curl -o /home/$USERNAME/hl-visor $HL_VISOR_URL \
-    && curl -o /home/$USERNAME/hl-visor.asc $HL_VISOR_ASC_URL \
-    && gpg --verify /home/$USERNAME/hl-visor.asc /home/$USERNAME/hl-visor \
-    && chmod +x /home/$USERNAME/hl-visor
-
-# Expose gossip ports
-EXPOSE 4000-4010
-
-# Run a non-validating node
-ENTRYPOINT ["/home/hluser/hl-visor", "run-non-validator", "--write-fills", "--serve-eth-rpc","--serve-info", "--write-misc-events", "--replica-cmds-style", "recent-actions", "--disable-output-file-buffering"]
+# Run the streaming service
+ENTRYPOINT ["python", "-m", "streaming.main"]
