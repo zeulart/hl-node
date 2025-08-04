@@ -4,10 +4,15 @@ ARG USERNAME=hluser
 ARG USER_UID=10000
 ARG USER_GID=$USER_UID
 
-# Install system dependencies
+# Install system dependencies and uv
 RUN apt-get update -y && apt-get install -y \
     gcc \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    curl \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Add uv to PATH
+ENV PATH="/root/.cargo/bin:$PATH"
 
 # Create user
 RUN groupadd --gid $USER_GID $USERNAME \
@@ -16,13 +21,13 @@ RUN groupadd --gid $USER_GID $USERNAME \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+# Copy project files
+COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
 COPY config/ ./config/
+
+# Install dependencies with uv
+RUN uv sync --frozen
 
 # Change ownership to non-root user
 RUN chown -R $USERNAME:$USERNAME /app
@@ -35,7 +40,7 @@ ENV PYTHONPATH=/app/src
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import redis; r=redis.Redis(host='redis'); r.ping()" || exit 1
+    CMD uv run python -c "import redis.asyncio as redis; import asyncio; asyncio.run(redis.Redis(host='redis').ping())" || exit 1
 
 # Run the streaming service
-ENTRYPOINT ["python", "-m", "streaming.main"]
+ENTRYPOINT ["uv", "run", "python", "-m", "streaming.main"]
