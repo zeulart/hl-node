@@ -204,8 +204,7 @@ class RedisStreamConsumer:
         current_hour = now_utc.strftime('%Y%m%d:%H')
         
         expected_streams = {
-            f"node_fills:{current_hour}",  # Current hour stream
-            "node_fills:ALL"               # Aggregate stream (if used)
+            f"node_fills:{current_hour}"   # Only hourly streams
         }
         
         # Include previous hour during transition period (first 5 minutes of new hour)
