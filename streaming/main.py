@@ -33,6 +33,8 @@ ENV          = os.getenv
 LOG_DIR      = Path(ENV("LOG_PATH", "/home/hluser/hl/data/node_fills/hourly"))
 R_HOST       = ENV("REDIS_HOST", "localhost")
 R_PORT       = int(ENV("REDIS_PORT", "6379"))
+R_PASSWORD   = ENV("REDIS_PASSWORD")
+R_PASS_FILE  = ENV("REDIS_PASSWORD_FILE")
 PREFIX       = ENV("REDIS_STREAM_PREFIX", "node_fills")
 BUFFER_SIZE  = int(ENV("BUFFER_SIZE", "131072"))
 PIPE_SIZE    = int(ENV("PIPELINE_SIZE", "20"))
@@ -96,10 +98,39 @@ def newest_file() -> Optional[Path]:
 
 # ───────────────────────── redis buffer ─────────────────────────────
 
+def _get_redis_password() -> Optional[str]:
+    """Get Redis password from file or environment variable."""
+    if R_PASS_FILE:
+        try:
+            with open(R_PASS_FILE, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except (FileNotFoundError, PermissionError) as e:
+            logger.warning("Failed to read Redis password file %s: %s", R_PASS_FILE, e)
+    return R_PASSWORD
+
 def _connect() -> redis.Redis:
-    r = redis.Redis(host=R_HOST, port=R_PORT, decode_responses=False)
-    r.ping()
-    return r
+    password = _get_redis_password()
+    # Try ACL user first, fallback to default auth if ACL not configured
+    try:
+        r = redis.Redis(
+            host=R_HOST, 
+            port=R_PORT, 
+            password=password,
+            username="streaming_producer",  # Use ACL user for streams
+            decode_responses=False
+        )
+        r.ping()
+        return r
+    except redis.AuthenticationError:
+        # Fallback to password-only auth (for initial setup)
+        r = redis.Redis(
+            host=R_HOST, 
+            port=R_PORT, 
+            password=password,
+            decode_responses=False
+        )
+        r.ping()
+        return r
 
 
 class RedisBuffer:

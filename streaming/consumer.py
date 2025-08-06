@@ -33,6 +33,9 @@ class ConsumerConfig:
         self.redis_host = os.getenv("REDIS_HOST", "localhost")
         self.redis_port = int(os.getenv("REDIS_PORT", "6379"))
         self.redis_timeout = int(os.getenv("REDIS_TIMEOUT", "5"))
+        self.redis_password = os.getenv("REDIS_PASSWORD")
+        self.redis_password_file = os.getenv("REDIS_PASSWORD_FILE")
+        self.redis_username = os.getenv("REDIS_USERNAME", "streaming_consumer")
         self.stream_pattern = os.getenv("STREAM_PATTERN", "node_fills:*")
         self.stats_interval = int(os.getenv("STATS_INTERVAL", "1"))
         self.read_count = int(os.getenv("READ_COUNT", "50"))
@@ -54,10 +57,23 @@ class ConsumerConfig:
         if self.retry_delay < 0:
             raise ValueError(f"Retry delay must be >= 0: {self.retry_delay}")
     
+    def get_redis_password(self) -> Optional[str]:
+        """Get Redis password from file or environment variable"""
+        if self.redis_password_file:
+            try:
+                with open(self.redis_password_file, 'r', encoding='utf-8') as f:
+                    return f.read().strip()
+            except (FileNotFoundError, PermissionError) as e:
+                # Don't log password details for security
+                pass
+        return self.redis_password
+
     def summary(self) -> str:
         """Return configuration summary for logging"""
+        auth_status = "with auth" if (self.redis_password or self.redis_password_file) else "no auth"
         return (
-            f"Redis={self.redis_host}:{self.redis_port}, "
+            f"Redis={self.redis_host}:{self.redis_port} ({auth_status}), "
+            f"User={self.redis_username}, "
             f"Pattern={self.stream_pattern}, "
             f"Stats={self.stats_interval}s, "
             f"Retries={self.max_retries}, "
@@ -174,9 +190,12 @@ class RedisStreamConsumer:
         """Connect to Redis with retry logic"""
         for attempt in range(1, self.config.max_retries + 1):
             try:
+                password = self.config.get_redis_password()
                 client = redis.Redis(
                     host=self.config.redis_host,
                     port=self.config.redis_port,
+                    password=password,
+                    username=self.config.redis_username,
                     decode_responses=True,
                     socket_timeout=self.config.redis_timeout,
                     socket_connect_timeout=self.config.redis_timeout,

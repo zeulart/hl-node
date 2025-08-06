@@ -15,11 +15,10 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen
 
 # Layer 4: Application code (changes frequently)
-COPY main.py ./
-COPY examples/ ./examples/
+COPY main.py consumer.py ./
 RUN chown -R $USERNAME:$USERNAME /app
 
 USER $USERNAME
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD uv run python -c "import redis; redis.Redis(host='redis').ping()" || exit 1
+    CMD uv run python -c "import redis,os; p=open(os.getenv('REDIS_PASSWORD_FILE','/dev/null'),'r').read().strip() if os.getenv('REDIS_PASSWORD_FILE') else os.getenv('REDIS_PASSWORD'); redis.Redis(host='redis',password=p,username='streaming_producer').ping()" || exit 1
 ENTRYPOINT ["uv", "run", "python", "main.py"]
