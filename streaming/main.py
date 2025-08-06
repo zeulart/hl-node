@@ -157,8 +157,10 @@ class RedisBuffer:
                 self.backlog.extendleft(reversed(retry_items))
                 raise
         
-        # If we get here, all retries failed
-        logger.critical("Failed to flush data after %d attempts - data may be lost", max_retries)
+        # If we get here, all retries failed - initiate graceful shutdown
+        logger.critical("Failed to flush data after %d attempts - initiating graceful shutdown")
+        global shutdown
+        shutdown = True
 
     def close(self):
         self.flush(force=True)
