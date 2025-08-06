@@ -20,6 +20,11 @@ REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
 REDIS_STREAM = 'node_fills:ALL'
 
+# Timeout configurations for consistent behavior
+INOTIFY_TIMEOUT_SHORT = 0.5  # Quick event checks during active processing
+INOTIFY_TIMEOUT_MEDIUM = 2.0  # Regular event checks during idle periods
+INOTIFY_CHECK_INTERVAL = 2  # How often to check for rotation events
+
 # Global shutdown flag
 shutdown_requested = False
 
@@ -29,8 +34,8 @@ def signal_handler(signum, frame):
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     shutdown_requested = True
 
-def get_candidate_files():
-    """Get all potential log files for analysis"""
+def get_candidate_files(max_files=200):
+    """Get potential log files for analysis with memory limits"""
     candidates = []
     try:
         if not os.path.exists(LOG_DIR):
@@ -48,12 +53,28 @@ def get_candidate_files():
             try:
                 hours = sorted(os.listdir(day_dir))
                 for hour_file in hours:
+                    # Memory protection: limit number of candidate files
+                    if len(candidates) >= max_files:
+                        logger.warning(f"Reached maximum candidate files limit ({max_files}), stopping scan")
+                        break
+                        
                     file_path = os.path.join(day_dir, hour_file)
                     if os.path.isfile(file_path) and os.path.getsize(file_path) >= 0:
                         candidates.append(file_path)
+                        
+                # Break outer loop if we hit the limit
+                if len(candidates) >= max_files:
+                    break
+                    
             except (OSError, IOError) as e:
                 logger.warning(f"Error accessing directory {day_dir}: {e}")
                 continue
+        
+        # Sort candidates by modification time (newest first) and take most recent
+        if len(candidates) > max_files // 2:  # Keep most recent half if we have many
+            candidates.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0, reverse=True)
+            candidates = candidates[:max_files // 2]
+            logger.debug(f"Trimmed to {len(candidates)} most recent candidate files")
         
         logger.debug(f"Found {len(candidates)} candidate files")
         return candidates
@@ -117,7 +138,7 @@ def find_active_file_at_startup():
         logger.info(f"No growing files detected, using most recent: {most_recent[0]}")
         return most_recent[0]
 
-def process_inotify_events(watcher, timeout_s=1):
+def process_inotify_events(watcher, timeout_s=INOTIFY_TIMEOUT_MEDIUM):
     """Process inotify events for file rotation detection"""
     if not watcher:
         return None
@@ -142,12 +163,6 @@ def process_inotify_events(watcher, timeout_s=1):
                 if 'IN_MOVED_TO' in type_names:
                     logger.info(f"File moved in via inotify: {full_path}")
                     return full_path
-                
-                # File closed after writing (may indicate rotation completion)
-                if 'IN_CLOSE_WRITE' in type_names:
-                    logger.debug(f"File closed after write: {full_path}")
-                    # This could indicate a new file is ready, but we need to verify
-                    # it's newer than our current file to avoid switching back
                     
         return None
         
@@ -160,19 +175,38 @@ def wait_for_new_file_via_inotify(watcher, max_wait_time=30):
     logger.info(f"Waiting for new file via inotify (max {max_wait_time}s)")
     
     start_time = time.time()
-    while not shutdown_requested and (time.time() - start_time) < max_wait_time:
-        new_file = process_inotify_events(watcher, timeout_s=2)
+    event_count = 0
+    max_events = max_wait_time * 2  # Prevent infinite loops on bad events
+    
+    while (not shutdown_requested and 
+           (time.time() - start_time) < max_wait_time and 
+           event_count < max_events):
+        
+        new_file = process_inotify_events(watcher, timeout_s=INOTIFY_TIMEOUT_MEDIUM)
+        event_count += 1
+        
         if new_file and os.path.isfile(new_file):
             logger.info(f"Found new file via inotify: {new_file}")
             return new_file
+        
+        # Small delay to prevent tight loops on rapid invalid events
+        if event_count % 10 == 0:
+            time.sleep(0.1)
     
-    # Timeout reached, fallback to candidate search
-    logger.warning("inotify timeout reached, falling back to file search")
-    candidates = get_candidate_files()
-    if candidates:
-        most_recent = max(candidates, key=os.path.getmtime)
-        logger.info(f"Fallback: using most recent file {most_recent}")
-        return most_recent
+    # Timeout or max events reached, fallback to candidate search
+    if event_count >= max_events:
+        logger.warning(f"Max inotify events ({max_events}) reached, falling back to file search")
+    else:
+        logger.warning("inotify timeout reached, falling back to file search")
+        
+    try:
+        candidates = get_candidate_files()
+        if candidates:
+            most_recent = max(candidates, key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0)
+            logger.info(f"Fallback: using most recent file {most_recent}")
+            return most_recent
+    except Exception as e:
+        logger.error(f"Error in fallback file search: {e}")
     
     return None
 
@@ -194,14 +228,23 @@ def tail_log_file_with_inotify(file_path, rds, watcher=None):
                     time.sleep(0.2)
                     current_time = time.time()
                     
-                    # Check for file rotation via inotify (every 2 seconds when idle)
-                    if current_time - last_inotify_check > 2:
+                    # Check for file rotation via inotify (every N seconds when idle)
+                    if current_time - last_inotify_check > INOTIFY_CHECK_INTERVAL:
                         try:
-                            new_file = process_inotify_events(watcher, timeout_s=0.1)
+                            new_file = process_inotify_events(watcher, timeout_s=INOTIFY_TIMEOUT_SHORT)
                             if new_file and new_file != file_path and os.path.isfile(new_file):
-                                # Verify the new file is actually newer
-                                if os.path.getmtime(new_file) > os.path.getmtime(file_path):
-                                    logger.info(f"inotify detected newer file: {new_file}")
+                                # Verify the new file is actually newer (handle race conditions)
+                                try:
+                                    new_mtime = os.path.getmtime(new_file)
+                                    current_mtime = os.path.getmtime(file_path)
+                                    if new_mtime > current_mtime:
+                                        logger.info(f"inotify detected newer file: {new_file}")
+                                        return new_file
+                                except (OSError, IOError) as e:
+                                    # Race condition: file disappeared during mtime check
+                                    logger.warning(f"Race condition during file comparison: {e}")
+                                    # If we can't compare times, trust inotify and switch anyway
+                                    logger.info(f"Trusting inotify event, switching to: {new_file}")
                                     return new_file
                             last_inotify_check = current_time
                         except Exception as e:
@@ -395,8 +438,21 @@ def main():
         try:
             rds.close()
             logger.info("Redis connection closed")
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Error closing Redis connection: {e}")
+        
+        # Cleanup inotify watcher
+        try:
+            if watcher:
+                # The inotify watcher should be closed automatically when it goes out of scope
+                # but we can try to clean up explicitly if there's a close method
+                if hasattr(watcher, 'close'):
+                    watcher.close()
+                elif hasattr(watcher, '_inotify') and hasattr(watcher._inotify, 'close'):
+                    watcher._inotify.close()
+                logger.info("inotify watcher cleaned up")
+        except Exception as e:
+            logger.warning(f"Error cleaning up inotify watcher: {e}")
             
     logger.info("Hyperliquid log streaming service stopped")
     return 0
