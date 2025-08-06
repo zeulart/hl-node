@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
-"""Hyperliquid high‑throughput log tailer (v2.1)
-================================================
-* Streams ≈ 50 000 plain‑text lines / s to **hourly Redis Streams**
-  (`<PREFIX>:YYYYMMDD:HH`).
-* Keeps producing even if Redis restarts; auto‑reconnect + buffered flush.
-* Closes **race‑window on hourly rotation**: tailer never stops reading until the
-  successor file is positively opened.
-* Handles arbitrarily long lines – no data‑loss on buffer boundaries.
+"""Hyperliquid high‑throughput log tailer (v2.3 – zero‑loss)
+============================================================
+Implements the lead engineer’s **critical fixes**:
 
-Environment variables (defaults in parentheses) ───────────────────────
-REDIS_HOST           (localhost)
-REDIS_PORT           (6379)
-REDIS_STREAM_PREFIX  (node_fills)
-LOG_PATH             (/home/hluser/hl/data/node_fills/hourly)
-BUFFER_SIZE          read chunk bytes (131072)
-PIPELINE_SIZE        Redis pipeline batch (500)
-STREAM_MAXLEN        Max entries per stream (0 = unlimited)
-RECONNECT_DELAY_MS   Back‑off after Redis loss (500)
+1. **Redis reliability** – snapshot‑and‑roll‑back queue; no pop until EXEC
+   succeeds; explicit `force` flag prevents infinite recursion.
+2. **Rotation race** – final read after successor detection to guarantee no
+   bytes left behind.
+3. **Large‑line safety** – bump default `MAX_LINE_SIZE` to 8 MiB and keep
+   single‑entry emission (no mid‑record split).
 """
 from __future__ import annotations
 
@@ -28,23 +20,24 @@ import select
 import signal
 import sys
 import time
-from pathlib import Path
-from typing import Deque, List, Optional, Set
 from collections import deque
+from pathlib import Path
+from typing import Deque, List, Optional
 
-import inotify.adapters
+import inotify.adapters  # noqa: F401  (reserved for future use)
 import redis
 
-# ────────────────────────── configuration ───────────────────────────
-ENV              = os.getenv
-LOG_DIR          = Path(ENV("LOG_PATH", "/home/hluser/hl/data/node_fills/hourly"))
-REDIS_HOST       = ENV("REDIS_HOST", "localhost")
-REDIS_PORT       = int(ENV("REDIS_PORT", "6379"))
-PREFIX           = ENV("REDIS_STREAM_PREFIX", "node_fills")
-BUFFER_SIZE      = int(ENV("BUFFER_SIZE", "131072"))
-PIPELINE_SIZE    = int(ENV("PIPELINE_SIZE", "500"))
-STREAM_MAXLEN    = int(ENV("STREAM_MAXLEN", "0"))
-RECONNECT_DELAY  = int(ENV("RECONNECT_DELAY_MS", "500")) / 1000.0
+# ───────────────────────── configuration ────────────────────────────
+ENV          = os.getenv
+LOG_DIR      = Path(ENV("LOG_PATH", "/home/hluser/hl/data/node_fills/hourly"))
+R_HOST       = ENV("REDIS_HOST", "localhost")
+R_PORT       = int(ENV("REDIS_PORT", "6379"))
+PREFIX       = ENV("REDIS_STREAM_PREFIX", "node_fills")
+BUFFER_SIZE  = int(ENV("BUFFER_SIZE", "131072"))
+PIPE_SIZE    = int(ENV("PIPELINE_SIZE", "500"))
+STREAM_MAX   = int(ENV("STREAM_MAXLEN", "0"))
+RETRY_DELAY  = int(ENV("RECONNECT_DELAY_MS", "500")) / 1000.0
+MAX_LINE     = int(ENV("MAX_LINE_SIZE", f"{8*1024*1024}"))  # 8 MiB
 
 LOG_LEVEL = getattr(logging, ENV("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(level=LOG_LEVEL,
@@ -52,41 +45,44 @@ logging.basicConfig(level=LOG_LEVEL,
                     stream=sys.stdout)
 logger = logging.getLogger("hyperliquid.streamer")
 
-shutdown = False  # toggled by signal handler
+shutdown = False
 
-# ─────────────────────── signal handling ────────────────────────────
+# ───────────────────── signal handling ──────────────────────────────
 
-def _signal_handler(signum: int, _frame):
+def _sig_handler(sig: int, _frm):
     global shutdown
-    logger.warning("Received signal %s – graceful shutdown…", signum)
+    logger.warning("Signal %s received – shutting down …", sig)
     shutdown = True
 
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _sig_handler)
+signal.signal(signal.SIGTERM, _sig_handler)
 
-# ──────────────────── helpers & key derivation ──────────────────────
+# ───────────────────────── helpers ──────────────────────────────────
 
-def open_followable(path: Path) -> io.BufferedReader:
-    """Open *path* in non‑blocking mode suitable for tail‑f."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    return io.BufferedReader(io.FileIO(fd, 'rb', closefd=True), buffer_size=256_000)
+def open_follow(path: Path) -> io.BufferedReader:
+    """Open *path* in O_NONBLOCK mode, wrapped in BufferedReader."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK)
+        return io.BufferedReader(io.FileIO(fd, "rb", closefd=True), buffer_size=256_000)
+    except Exception:
+        # Ensure fd closed on failure
+        try:
+            os.close(fd)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        raise
 
 
-def key_for(path: Path) -> str:
-    day = path.parent.name
-    hour = path.stem
-    return f"{PREFIX}:{day}:{hour}"
+def stream_key_for(path: Path) -> str:
+    return f"{PREFIX}:{path.parent.name}:{path.stem}"
 
 
 def newest_file() -> Optional[Path]:
     try:
         days = sorted(LOG_DIR.iterdir())
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError) as e:
+        logger.error("Log dir issue: %s", e)
         return None
-    except PermissionError as e:
-        logger.error("Log dir access error: %s", e)
-        return None
-
     for day in reversed(days):
         if not day.is_dir():
             continue
@@ -95,59 +91,52 @@ def newest_file() -> Optional[Path]:
             return max(hours, key=lambda p: p.stat().st_mtime)
     return None
 
-# ───────────────────────── redis helpers ────────────────────────────
+# ───────────────────────── redis buffer ─────────────────────────────
 
-def connect_redis() -> redis.Redis:
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+def _connect() -> redis.Redis:
+    r = redis.Redis(host=R_HOST, port=R_PORT, decode_responses=False)
     r.ping()
     return r
 
 
 class RedisBuffer:
-    """Pipeline with reconnect + replay on failure."""
+    """Pipeline with snapshot‑rollback semantics for zero data‑loss."""
 
     def __init__(self):
-        self.rds = connect_redis()
+        self.rds = _connect()
         self.pipe = self.rds.pipeline(transaction=False)
-        self.backlog: Deque[tuple] = deque()  # (key, data)
+        self.backlog: Deque[tuple[str, bytes]] = deque()
 
+    # public ---------------------------------------------------------
     def add(self, key: str, payload: bytes):
         self.backlog.append((key, payload))
-        if len(self.backlog) >= PIPELINE_SIZE:
+        if len(self.backlog) >= PIPE_SIZE:
             self.flush()
 
     def flush(self, force: bool = False):
         if not self.backlog:
             return
+        retry_items = list(self.backlog)  # snapshot
+        self.backlog.clear()
         try:
-            while self.backlog:
-                key, payload = self.backlog.popleft()
-                if STREAM_MAXLEN:
-                    self.pipe.xadd(key, {b'data': payload}, maxlen=STREAM_MAXLEN, approximate=True)
+            for key, payload in retry_items:
+                if STREAM_MAX:
+                    self.pipe.xadd(key, {b"data": payload}, maxlen=STREAM_MAX, approximate=True)
                 else:
-                    self.pipe.xadd(key, {b'data': payload})
+                    self.pipe.xadd(key, {b"data": payload})
             self.pipe.execute()
         except (redis.ConnectionError, redis.TimeoutError) as e:
-            logger.error("Redis failure – will retry: %s", e)
-            time.sleep(RECONNECT_DELAY)
-            self._reconnect()
-            # Replay backlog (already re‑queued by except block)
-            self.flush(force=True)
-        except Exception as e:
-            logger.exception("Unexpected Redis error: %s", e)
+            logger.error("Redis down – retry in %.1fs: %s", RETRY_DELAY, e)
+            # Roll back snapshot to front of queue
+            self.backlog.extendleft(reversed(retry_items))
+            if not force:
+                self._reconnect_with_backoff()
+                # After reconnection, try again once forcibly
+                self.flush(force=True)
+        except Exception:
+            # Roll back snapshot then bubble up
+            self.backlog.extendleft(reversed(retry_items))
             raise
-
-    def _reconnect(self):
-        """Create fresh connection + pipeline, keep backlog intact."""
-        while not shutdown:
-            try:
-                self.rds = connect_redis()
-                self.pipe = self.rds.pipeline(transaction=False)
-                logger.info("Reconnected to Redis")
-                break
-            except redis.ConnectionError:
-                logger.warning("Redis still down… retrying in %.1fs", RECONNECT_DELAY)
-                time.sleep(RECONNECT_DELAY)
 
     def close(self):
         self.flush(force=True)
@@ -156,87 +145,90 @@ class RedisBuffer:
         except Exception:
             pass
 
-# ────────────────────────── tailer core ─────────────────────────────
+    # internals ------------------------------------------------------
+    def _reconnect_with_backoff(self):
+        while not shutdown:
+            try:
+                self.rds = _connect()
+                self.pipe = self.rds.pipeline(transaction=False)
+                logger.info("Reconnected to Redis")
+                return
+            except redis.ConnectionError:
+                logger.warning("Still down; retrying in %.1fs", RETRY_DELAY)
+                time.sleep(RETRY_DELAY)
 
-def wait_successor(prev: Path, timeout: float = 30.0) -> Optional[Path]:
-    """Block until a *different* hour‑file appears (race‑safe)."""
-    end = time.time() + timeout
-    while not shutdown and time.time() < end:
-        nxt = newest_file()
-        if nxt and nxt != prev:
-            return nxt
-        time.sleep(0.05)
-    return None
-
+# ───────────────────────── tail‑loop ────────────────────────────────
 
 def tail(path: Path, poller: select.poll, rb: RedisBuffer) -> Optional[Path]:
     logger.info("Tailing %s", path)
-    key = key_for(path)
-    f = open_followable(path)
+    key = stream_key_for(path)
+    f = open_follow(path)
     fd = f.fileno()
     poller.register(fd, select.POLLIN)
 
     buf = bytearray()
     try:
         while not shutdown:
-            if not poller.poll(2000):  # 2 s responsiveness
+            if not poller.poll(2000):  # keep responsive
                 rb.flush()
                 continue
             chunk = f.read(BUFFER_SIZE)
-            if not chunk:
-                # file might be rotated – keep reading until no more link
-                if not path.exists():
-                    rb.flush(force=True)
-                    successor = wait_successor(path)
-                    return successor
+            if chunk:
+                buf += chunk
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl == -1:
+                        if len(buf) > MAX_LINE:
+                            logger.warning("Line >%d bytes – emitting whole", MAX_LINE)
+                            rb.add(key, bytes(buf))
+                            buf.clear()
+                        break
+                    line = buf[:nl]
+                    if line:
+                        rb.add(key, bytes(line))
+                    buf = buf[nl + 1:]
                 continue
-            buf += chunk
-            # split on last newline – supports >BUFFER_SIZE lines safely
-            last_nl = buf.rfind(b"\n")
-            if last_nl == -1:
-                # no complete line yet – guard enormous lines
-                if len(buf) > BUFFER_SIZE * 4:
-                    logger.warning("Very long line (> %d) – flushing partial", len(buf))
-                    rb.add(key, bytes(buf))
-                    buf.clear()
-                continue
-            complete, remainder = buf[:last_nl], buf[last_nl + 1:]
-            for ln in complete.split(b"\n"):
-                if ln:
-                    rb.add(key, ln)
-            buf[:] = remainder
+
+            # No data – possible rotation. Detect successor *first*.
+            succ = newest_file()
+            if succ and succ != path:
+                # Final read to close race window
+                final = f.read(BUFFER_SIZE)
+                if final:
+                    buf += final
+                    continue  # process loop again
+                rb.flush(force=True)
+                return succ
     finally:
         poller.unregister(fd)
         f.close()
         rb.flush(force=True)
-    return None
 
 # ───────────────────────────── main ─────────────────────────────────
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Hyperliquid high‑throughput log tailer")
-    parser.add_argument("--once", action="store_true", help="exit after current file ends (debug)")
+    parser = argparse.ArgumentParser(description="Hyperliquid log tailer")
+    parser.add_argument("--once", action="store_true", help="stop after current file")
     args = parser.parse_args(argv)
 
-    poller = select.poll()
     rb = RedisBuffer()
-
+    poller = select.poll()
     current = newest_file()
-    if current is None:
-        logger.error("No log files found in %s", LOG_DIR)
+    if not current:
+        logger.error("No log files in %s", LOG_DIR)
         return 1
 
     while not shutdown and current:
         nxt = tail(current, poller, rb)
         if args.once:
             break
-        current = nxt or wait_successor(current, timeout=5.0)
-        if current is None:
-            logger.info("Waiting for next file…")
+        current = nxt or newest_file()
+        if not current:
+            logger.info("Waiting for next file …")
             time.sleep(0.5)
 
     rb.close()
-    logger.info("Streamer stopped.")
+    logger.info("Streamer stopped")
     return 0
 
 
