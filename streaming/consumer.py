@@ -21,7 +21,7 @@ import signal
 import sys
 import time
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Set, Optional
 import redis
 
@@ -198,20 +198,23 @@ class RedisStreamConsumer:
         
         raise redis.ConnectionError("Max retries exceeded")
     
-    def _discover_active_streams(self) -> Set[str]:
-        """Discover all active streams matching the pattern"""
-        try:
-            streams = set()
-            for key in self.redis_client.scan_iter(match=self.config.stream_pattern):
-                if self.redis_client.xlen(key) > 0:
-                    streams.add(key)
-            
-            self.logger.debug(f"Discovered {len(streams)} active streams")
-            return streams
-            
-        except redis.RedisError as e:
-            self.logger.error(f"Error discovering streams: {e}")
-            return set()
+    def _get_expected_streams(self) -> Set[str]:
+        """Infer current streams from UTC time instead of scanning Redis"""
+        now_utc = datetime.now(timezone.utc)
+        current_hour = now_utc.strftime('%Y%m%d:%H')
+        
+        expected_streams = {
+            f"node_fills:{current_hour}",  # Current hour stream
+            "node_fills:ALL"               # Aggregate stream (if used)
+        }
+        
+        # Include previous hour during transition period (first 5 minutes of new hour)
+        if now_utc.minute < 5:
+            prev_hour = (now_utc - timedelta(hours=1)).strftime('%Y%m%d:%H')
+            expected_streams.add(f"node_fills:{prev_hour}")
+        
+        self.logger.debug(f"Expected {len(expected_streams)} streams: {sorted(expected_streams)}")
+        return expected_streams
     
     def _handle_stream_rotation(self):
         """Check for hourly rotation and update stream list"""
@@ -220,23 +223,23 @@ class RedisStreamConsumer:
             self.logger.info(f"Hour rotation detected: {new_hour[:8]} {new_hour[8:]}:00 UTC")
             self.current_hour = new_hour
             
-            # Discover new streams
-            active_streams = self._discover_active_streams()
+            # Get expected streams based on current UTC time
+            expected_streams = self._get_expected_streams()
             
-            # Add new streams
-            new_streams = active_streams - set(self.stream_positions.keys())
+            # Add new expected streams
+            new_streams = expected_streams - set(self.stream_positions.keys())
             for stream in new_streams:
                 self.stream_positions[stream] = '$'  # Start from latest
-                self.logger.info(f"Added stream: {stream}")
+                self.logger.info(f"Added expected stream: {stream}")
             
-            # Remove inactive streams
-            inactive_streams = set(self.stream_positions.keys()) - active_streams
-            for stream in inactive_streams:
-                self.logger.info(f"Removed inactive stream: {stream}")
+            # Remove old streams (those not in expected set)
+            old_streams = set(self.stream_positions.keys()) - expected_streams
+            for stream in old_streams:
+                self.logger.info(f"Removed old stream: {stream}")
                 del self.stream_positions[stream]
             
-            if new_streams or inactive_streams:
-                self.logger.info(f"Stream update complete: {len(self.stream_positions)} active streams")
+            if new_streams or old_streams:
+                self.logger.info(f"Stream rotation complete: {len(self.stream_positions)} active streams")
     
     def _process_messages(self, messages):
         """Process Redis stream messages"""
@@ -293,14 +296,14 @@ class RedisStreamConsumer:
             # Connect to Redis
             self.redis_client = self._connect_redis()
             
-            # Initial stream discovery
-            active_streams = self._discover_active_streams()
-            for stream in active_streams:
+            # Initial stream setup using expected streams
+            expected_streams = self._get_expected_streams()
+            for stream in expected_streams:
                 self.stream_positions[stream] = '$'  # Start from latest
-                self.logger.info(f"Monitoring stream: {stream}")
+                self.logger.info(f"Monitoring expected stream: {stream}")
             
             if not self.stream_positions:
-                self.logger.warning("No active streams found initially")
+                self.logger.warning("No expected streams configured")
             
             self.logger.info("Consumer started successfully")
             
@@ -316,15 +319,25 @@ class RedisStreamConsumer:
                         time.sleep(5)
                         continue
                     
-                    # Read from streams
-                    messages = self.redis_client.xread(
-                        self.stream_positions,
-                        block=self.config.read_timeout,
-                        count=self.config.read_count
-                    )
-                    
-                    if messages:
-                        self._process_messages(messages)
+                    # Read from streams with graceful handling of missing streams
+                    try:
+                        messages = self.redis_client.xread(
+                            self.stream_positions,
+                            block=self.config.read_timeout,
+                            count=self.config.read_count
+                        )
+                        
+                        if messages:
+                            self._process_messages(messages)
+                            
+                    except redis.ResponseError as e:
+                        # Handle missing streams gracefully
+                        if "NOGROUP" in str(e) or "does not exist" in str(e).lower():
+                            self.logger.debug(f"Expected stream not yet available: {e}")
+                            # Remove non-existent streams temporarily
+                            self._cleanup_missing_streams()
+                        else:
+                            raise
                     
                     # Report stats if needed
                     if self.metrics.should_report():
@@ -377,6 +390,18 @@ class RedisStreamConsumer:
         )
         
         self.logger.info("Consumer shutdown complete")
+    
+    def _cleanup_missing_streams(self):
+        """Remove streams that don't exist from position tracking"""
+        streams_to_check = list(self.stream_positions.keys())
+        for stream in streams_to_check:
+            try:
+                # Quick check if stream exists
+                self.redis_client.xlen(stream)
+            except redis.ResponseError:
+                # Stream doesn't exist, remove from tracking
+                self.logger.debug(f"Temporarily removing non-existent stream: {stream}")
+                del self.stream_positions[stream]
 
 
 def main():
