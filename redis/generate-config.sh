@@ -1,3 +1,10 @@
+#!/bin/sh
+# Generate Redis configuration with environment variables
+
+# Create config directory if it doesn't exist
+mkdir -p /usr/local/etc/redis
+
+cat > /usr/local/etc/redis/redis.conf << EOF
 # Redis Security Configuration for Hyperliquid Streaming
 # Network exposure with strong security measures
 
@@ -18,12 +25,7 @@ tcp-backlog 511
 # ======================================================================
 # AUTHENTICATION & SECURITY
 # ======================================================================
-# Load password from environment variable set by Docker
-# Docker will populate this from the secrets file
-requirepass CHANGE_ME_GENERATE_STRONG_PASSWORD_HERE
-
-# Enable ACL system (configured via ACL commands instead of file)
-# aclfile /data/users.acl
+requirepass $REDIS_PASSWORD
 
 # Disable dangerous commands that could compromise system
 rename-command FLUSHDB ""
@@ -83,3 +85,4 @@ syslog-enabled no
 # ======================================================================
 slowlog-log-slower-than 10000
 slowlog-max-len 128
+EOF

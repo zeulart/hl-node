@@ -14,17 +14,15 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"  # Expose for external Docker access
+      - "${REDIS_PORT:-6379}:6379"  # Expose for external Docker access
     volumes:
       - redis-data:/data
-      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
       - ./redis/init-redis.sh:/usr/local/bin/init-redis.sh:ro
+      - ./redis/generate-config.sh:/usr/local/bin/generate-config.sh:ro
     command: >
       sh /usr/local/bin/init-redis.sh
     environment:
-      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
-    secrets:
-      - redis_password
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
     sysctls:
       - net.core.somaxconn=65535
 
@@ -42,20 +40,14 @@ services:
     depends_on:
       - redis
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - LOG_PATH=/home/hluser/hl/data/node_fills/hourly
-      - PIPELINE_SIZE=20
-      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
-    secrets:
-      - redis_password
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - LOG_PATH=${LOG_PATH:-/home/hluser/hl/data/node_fills/hourly}
+      - PIPELINE_SIZE=${PIPELINE_SIZE:-20}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
 
 volumes:
   hl-data:
     driver: local
   redis-data:
     driver: local
-
-secrets:
-  redis_password:
-    file: ./redis/redis_password.txt
