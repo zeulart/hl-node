@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Hyperliquid high-throughput log tailer (v2.4 - production-ready)
+"""Hyperliquid high-throughput log tailer (v2.5 - time-based)
 ====================================================================
-Implements ALL lead engineer critical fixes for production deployment:
+Production-ready implementation with time-based log file discovery:
 
-1. **Redis reliability** - proper retry limits, fresh pipelines, no data loss
-2. **Resource management** - safe file descriptor handling in open_follow()  
-3. **Memory protection** - bounded backlog queue (MAX_BACKLOG_SIZE=10000)
-4. **Race condition** - final read after successor detection
-5. **Large-line safety** - 8 MiB limit with whole-record emission
+1. **Time-based file discovery** - deterministic path calculation from UTC time
+2. **Redis reliability** - proper retry limits, fresh pipelines, no data loss
+3. **Resource management** - safe file descriptor handling in open_follow()  
+4. **Memory protection** - bounded backlog queue (MAX_BACKLOG_SIZE=10000)
+5. **Race condition safety** - final read after successor detection
+6. **Large-line safety** - 8 MiB limit with whole-record emission
 
 Production-ready: Zero data loss, bounded memory, robust error handling.
 """
@@ -23,9 +24,9 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from typing import Deque, List, Optional
 
-import inotify.adapters  # noqa: F401  (reserved for future use)
 import redis
 
 # ───────────────────────── configuration ────────────────────────────
@@ -82,19 +83,39 @@ def stream_key_for(path: Path) -> str:
     return f"{PREFIX}:{path.parent.name}:{path.stem}"
 
 
-def newest_file() -> Optional[Path]:
-    try:
-        days = sorted(LOG_DIR.iterdir())
-    except (FileNotFoundError, PermissionError) as e:
-        logger.error("Log dir issue: %s", e)
-        return None
-    for day in reversed(days):
-        if not day.is_dir():
-            continue
-        hours = sorted(day.iterdir())
-        if hours:
-            return max(hours, key=lambda p: p.stat().st_mtime)
-    return None
+def get_expected_log_file() -> Optional[Path]:
+    """Get the expected log file based on current UTC time.
+    
+    Returns the current hour's log file. During the first 5 minutes of a new hour,
+    checks if the new file exists, otherwise returns the previous hour's file.
+    """
+    now_utc = datetime.now(timezone.utc)
+    current_day = now_utc.strftime('%Y%m%d')
+    current_hour = now_utc.strftime('%H')
+    
+    # Build expected path for current hour
+    current_path = LOG_DIR / current_day / current_hour
+    
+    # During transition period (first 5 minutes), check both current and previous
+    if now_utc.minute < 5:
+        # Check if current hour's file exists
+        if current_path.exists():
+            return current_path
+        
+        # Fall back to previous hour
+        prev_time = now_utc - timedelta(hours=1)
+        prev_day = prev_time.strftime('%Y%m%d')
+        prev_hour = prev_time.strftime('%H')
+        prev_path = LOG_DIR / prev_day / prev_hour
+        
+        if prev_path.exists():
+            return prev_path
+        else:
+            # Neither exists - return current (will wait for creation)
+            return current_path
+    
+    # Not in transition period - return current hour's path
+    return current_path if current_path.exists() else None
 
 # ───────────────────────── redis buffer ─────────────────────────────
 
@@ -244,8 +265,8 @@ def tail(path: Path, poller: select.poll, rb: RedisBuffer) -> Optional[Path]:
                     buf = buf[nl + 1:]
                 continue
 
-            # No data – possible rotation. Detect successor *first*.
-            succ = newest_file()
+            # No data – possible rotation. Check for hour change.
+            succ = get_expected_log_file()
             if succ and succ != path:
                 # Final read to close race window
                 final = f.read(BUFFER_SIZE)
@@ -253,6 +274,7 @@ def tail(path: Path, poller: select.poll, rb: RedisBuffer) -> Optional[Path]:
                     buf += final
                     continue  # process loop again
                 rb.flush(force=True)
+                logger.info("Hour rotation detected: %s -> %s", path, succ)
                 return succ
     finally:
         poller.unregister(fd)
@@ -268,7 +290,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     rb = RedisBuffer()
     poller = select.poll()
-    current = newest_file()
+    current = get_expected_log_file()
     if not current:
         logger.error("No log files in %s", LOG_DIR)
         return 1
@@ -277,7 +299,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         nxt = tail(current, poller, rb)
         if args.once:
             break
-        current = nxt or newest_file()
+        current = nxt or get_expected_log_file()
         if not current:
             logger.info("Waiting for next file …")
             time.sleep(0.5)
