@@ -29,46 +29,159 @@ def signal_handler(signum, frame):
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     shutdown_requested = True
 
-def get_latest_file():
-    """Find the most recent log file"""
+def get_candidate_files():
+    """Get all potential log files for analysis"""
+    candidates = []
     try:
         if not os.path.exists(LOG_DIR):
             logger.error(f"Log directory does not exist: {LOG_DIR}")
-            return None
+            return candidates
             
         days = sorted(os.listdir(LOG_DIR))
         if not days:
             logger.warning(f"No date directories found in {LOG_DIR}")
-            return None
+            return candidates
         
-        # Try latest day first, then previous days if empty
-        for day_candidate in reversed(days):
+        # Look at the last 2 days to handle day transitions
+        for day_candidate in reversed(days[-2:]):
             day_dir = os.path.join(LOG_DIR, day_candidate)
             try:
                 hours = sorted(os.listdir(day_dir))
-                if hours:  # If day directory has hourly files
-                    last_hour = hours[-1]
-                    file_path = os.path.join(day_dir, last_hour)
-                    if os.path.exists(file_path) and os.path.getsize(file_path) >= 0:
-                        logger.debug(f"Found latest log file: {file_path}")
-                        return file_path
+                for hour_file in hours:
+                    file_path = os.path.join(day_dir, hour_file)
+                    if os.path.isfile(file_path) and os.path.getsize(file_path) >= 0:
+                        candidates.append(file_path)
             except (OSError, IOError) as e:
                 logger.warning(f"Error accessing directory {day_dir}: {e}")
                 continue
         
-        logger.error("No valid log files found in any date directory")
+        logger.debug(f"Found {len(candidates)} candidate files")
+        return candidates
+        
+    except Exception as e:
+        logger.error(f"Unexpected error getting candidate files: {e}")
+        return candidates
+
+def find_active_file_at_startup():
+    """Find actively growing log file using size-based detection"""
+    logger.info("Starting smart file detection at startup")
+    
+    candidates = get_candidate_files()
+    if not candidates:
+        logger.error("No candidate log files found")
+        return None
+    
+    logger.info(f"Analyzing {len(candidates)} candidate files for growth")
+    
+    # Take initial size measurements
+    initial_stats = {}
+    for file_path in candidates:
+        try:
+            if os.path.exists(file_path):
+                stat = os.stat(file_path)
+                initial_stats[file_path] = {
+                    'size': stat.st_size,
+                    'mtime': stat.st_mtime
+                }
+        except Exception as e:
+            logger.warning(f"Failed to stat file {file_path}: {e}")
+    
+    if not initial_stats:
+        logger.error("No files available for analysis")
+        return None
+    
+    logger.debug("Waiting 5 seconds to measure file growth...")
+    time.sleep(5)
+    
+    # Measure growth
+    grown_files = []
+    for file_path, initial in initial_stats.items():
+        try:
+            if os.path.exists(file_path):
+                current_size = os.path.getsize(file_path)
+                growth = current_size - initial['size']
+                if growth > 0:
+                    grown_files.append((file_path, growth))
+                    logger.debug(f"File {file_path} grew by {growth} bytes")
+        except Exception as e:
+            logger.warning(f"Failed to measure growth for {file_path}: {e}")
+    
+    if grown_files:
+        # Return file with most growth
+        active_file, growth = max(grown_files, key=lambda x: x[1])
+        logger.info(f"Selected actively growing file: {active_file} (grew {growth} bytes)")
+        return active_file
+    else:
+        # Fallback to most recent file by modification time
+        most_recent = max(initial_stats.items(), key=lambda x: x[1]['mtime'])
+        logger.info(f"No growing files detected, using most recent: {most_recent[0]}")
+        return most_recent[0]
+
+def process_inotify_events(watcher, timeout_s=1):
+    """Process inotify events for file rotation detection"""
+    if not watcher:
+        return None
+        
+    try:
+        for event in watcher.event_gen(yield_nones=False, timeout_s=timeout_s):
+            if event:
+                (_, type_names, path, filename) = event
+                
+                # Skip directory events
+                if 'IN_ISDIR' in type_names:
+                    continue
+                
+                full_path = os.path.join(path, filename)
+                
+                # New hourly file created
+                if 'IN_CREATE' in type_names:
+                    logger.info(f"New file detected via inotify: {full_path}")
+                    return full_path
+                    
+                # File moved into directory (common in log rotation)
+                if 'IN_MOVED_TO' in type_names:
+                    logger.info(f"File moved in via inotify: {full_path}")
+                    return full_path
+                
+                # File closed after writing (may indicate rotation completion)
+                if 'IN_CLOSE_WRITE' in type_names:
+                    logger.debug(f"File closed after write: {full_path}")
+                    # This could indicate a new file is ready, but we need to verify
+                    # it's newer than our current file to avoid switching back
+                    
         return None
         
     except Exception as e:
-        logger.error(f"Unexpected error in get_latest_file: {e}")
+        logger.warning(f"Error processing inotify events: {e}")
         return None
 
-def tail_log_file(file_path, rds, watcher=None):
-    """Tail log file in real-time and push new lines to Redis"""
+def wait_for_new_file_via_inotify(watcher, max_wait_time=30):
+    """Wait for a new log file to be created via inotify events"""
+    logger.info(f"Waiting for new file via inotify (max {max_wait_time}s)")
+    
+    start_time = time.time()
+    while not shutdown_requested and (time.time() - start_time) < max_wait_time:
+        new_file = process_inotify_events(watcher, timeout_s=2)
+        if new_file and os.path.isfile(new_file):
+            logger.info(f"Found new file via inotify: {new_file}")
+            return new_file
+    
+    # Timeout reached, fallback to candidate search
+    logger.warning("inotify timeout reached, falling back to file search")
+    candidates = get_candidate_files()
+    if candidates:
+        most_recent = max(candidates, key=os.path.getmtime)
+        logger.info(f"Fallback: using most recent file {most_recent}")
+        return most_recent
+    
+    return None
+
+def tail_log_file_with_inotify(file_path, rds, watcher=None):
+    """Tail log file in real-time using inotify for rotation detection"""
     logger.info(f"Starting to tail log file: {file_path}")
-    last_check_time = time.time()
     last_day_check = time.time()
     lines_processed = 0
+    last_inotify_check = time.time()
     
     try:
         with open(file_path, 'r') as f:
@@ -81,18 +194,20 @@ def tail_log_file(file_path, rds, watcher=None):
                     time.sleep(0.2)
                     current_time = time.time()
                     
-                    # Check for newer file periodically
-                    if current_time - last_check_time > 10:
+                    # Check for file rotation via inotify (every 2 seconds when idle)
+                    if current_time - last_inotify_check > 2:
                         try:
-                            latest = get_latest_file()
-                            if latest and latest != file_path:
-                                logger.info(f"Newer file detected, switching to: {latest}")
-                                return latest
-                            last_check_time = current_time
+                            new_file = process_inotify_events(watcher, timeout_s=0.1)
+                            if new_file and new_file != file_path and os.path.isfile(new_file):
+                                # Verify the new file is actually newer
+                                if os.path.getmtime(new_file) > os.path.getmtime(file_path):
+                                    logger.info(f"inotify detected newer file: {new_file}")
+                                    return new_file
+                            last_inotify_check = current_time
                         except Exception as e:
-                            logger.warning(f"Error checking for latest file: {e}")
+                            logger.warning(f"Error checking inotify events: {e}")
                     
-                    # Check for new day directories periodically
+                    # Check for new day directories periodically (keep this for day transitions)
                     if current_time - last_day_check > 60:
                         try:
                             check_and_add_new_day_watches(watcher)
@@ -100,10 +215,17 @@ def tail_log_file(file_path, rds, watcher=None):
                         except Exception as e:
                             logger.warning(f"Error updating directory watches: {e}")
                     
-                    # Check if file still exists
+                    # Check if current file still exists
                     if not os.path.exists(file_path):
-                        logger.warning(f"File disappeared (rotation?): {file_path}")
-                        break
+                        logger.warning(f"Current file disappeared: {file_path}")
+                        # Use inotify to find replacement file
+                        new_file = wait_for_new_file_via_inotify(watcher, max_wait_time=10)
+                        if new_file:
+                            logger.info(f"Found replacement file via inotify: {new_file}")
+                            return new_file
+                        else:
+                            logger.error("No replacement file found, stopping")
+                            break
                     
                     continue
                 
@@ -130,7 +252,7 @@ def tail_log_file(file_path, rds, watcher=None):
     except PermissionError:
         logger.error(f"Permission denied accessing file: {file_path}")
     except Exception as e:
-        logger.error(f"Unexpected error in tail_log_file: {e}")
+        logger.error(f"Unexpected error in tail_log_file_with_inotify: {e}")
     
     logger.info(f"Finished tailing {file_path}, processed {lines_processed} lines")
     return None
@@ -227,22 +349,41 @@ def main():
         logger.warning(f"inotify setup error: {e}, falling back to simple polling")
         watcher = None
     
-    # Main processing loop
+    # Smart startup file detection
+    current_file = find_active_file_at_startup()
+    if not current_file:
+        logger.error("Failed to find any log file at startup")
+        return 1
+    
+    # Main processing loop with inotify-based approach
     try:
         while not shutdown_requested:
-            latest = get_latest_file()
-            if latest and os.path.exists(latest):
-                if latest != current_file:
-                    logger.info(f"Switching to new file: {latest}")
-                    current_file = latest
+            if current_file and os.path.exists(current_file):
+                logger.info(f"Processing file: {current_file}")
                 
-                # Tail the file, which may return a newer file
-                next_file = tail_log_file(current_file, rds, watcher)
+                # Tail the file using inotify for rotation detection
+                next_file = tail_log_file_with_inotify(current_file, rds, watcher)
                 if next_file and not shutdown_requested:
                     current_file = next_file
+                else:
+                    # Current file finished, wait for new file via inotify
+                    logger.info("Current file finished, waiting for new file...")
+                    current_file = wait_for_new_file_via_inotify(watcher, max_wait_time=60)
+                    
+                    if not current_file:
+                        logger.warning("No new files detected via inotify, using fallback detection")
+                        candidates = get_candidate_files()
+                        if candidates:
+                            current_file = max(candidates, key=os.path.getmtime)
+                            logger.info(f"Fallback: selected {current_file}")
+                        else:
+                            logger.warning("No candidate files found, waiting...")
+                            time.sleep(5)
             else:
-                logger.warning("No log files found, waiting...")
-                time.sleep(2)
+                logger.warning("No current file available, searching for new files...")
+                current_file = wait_for_new_file_via_inotify(watcher, max_wait_time=30)
+                if not current_file:
+                    time.sleep(2)
                 
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
