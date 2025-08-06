@@ -2,6 +2,13 @@
 # Redis initialization script with ACL setup
 # This runs Redis server with automatic ACL configuration
 
+# Validate required environment variables
+if [ -z "$REDIS_PASSWORD" ]; then
+    echo "ERROR: REDIS_PASSWORD environment variable is required"
+    echo "Please ensure you're running with: docker compose --env-file .env up"
+    exit 1
+fi
+
 # Generate Redis configuration with current environment variables
 echo "Generating Redis configuration..."
 sh /usr/local/bin/generate-config.sh
@@ -23,7 +30,7 @@ redis-cli -a "$REDIS_PASSWORD" << EOF
 ACL SETUSER streaming_producer on >$REDIS_PASSWORD ~node_fills:* +ping +xadd +xlen
 ACL SETUSER streaming_consumer on >$REDIS_PASSWORD ~node_fills:* +ping +xread +xlen
 ACL SETUSER admin on >$REDIS_PASSWORD ~* &* +@all
-CONFIG REWRITE
+ACL SAVE
 EOF
 
 echo "ACL configuration complete. Users created:"

@@ -1,8 +1,19 @@
 #!/bin/sh
 # Generate Redis configuration with environment variables
+set -e  # Exit on any error
+
+# Validate required environment variables
+if [ -z "$REDIS_PASSWORD" ]; then
+    echo "ERROR: REDIS_PASSWORD environment variable is required"
+    echo "Please ensure you're running with: docker compose --env-file .env up"
+    exit 1
+fi
 
 # Create config directory if it doesn't exist
-mkdir -p /usr/local/etc/redis
+mkdir -p /usr/local/etc/redis || {
+    echo "ERROR: Cannot create Redis config directory"
+    exit 1
+}
 
 cat > /usr/local/etc/redis/redis.conf << EOF
 # Redis Security Configuration for Hyperliquid Streaming
