@@ -34,7 +34,7 @@ class ConsumerConfig:
         self.redis_port = int(os.getenv("REDIS_PORT", "6379"))
         self.redis_timeout = int(os.getenv("REDIS_TIMEOUT", "5"))
         self.stream_pattern = os.getenv("STREAM_PATTERN", "node_fills:*")
-        self.stats_interval = int(os.getenv("STATS_INTERVAL", "5"))
+        self.stats_interval = int(os.getenv("STATS_INTERVAL", "1"))
         self.read_count = int(os.getenv("READ_COUNT", "50"))
         self.read_timeout = int(os.getenv("READ_TIMEOUT", "1000"))
         self.max_retries = int(os.getenv("MAX_RETRIES", "5"))
