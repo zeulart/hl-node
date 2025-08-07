@@ -91,7 +91,7 @@ def get_expected_log_file() -> Optional[Path]:
     """
     now_utc = datetime.now(timezone.utc)
     current_day = now_utc.strftime('%Y%m%d')
-    current_hour = now_utc.strftime('%H')
+    current_hour = str(now_utc.hour)  # Single digit for hours 0-9
     
     # Build expected path for current hour
     current_path = LOG_DIR / current_day / current_hour
@@ -105,7 +105,7 @@ def get_expected_log_file() -> Optional[Path]:
         # Fall back to previous hour
         prev_time = now_utc - timedelta(hours=1)
         prev_day = prev_time.strftime('%Y%m%d')
-        prev_hour = prev_time.strftime('%H')
+        prev_hour = str(prev_time.hour)  # Single digit for hours 0-9
         prev_path = LOG_DIR / prev_day / prev_hour
         
         if prev_path.exists():
